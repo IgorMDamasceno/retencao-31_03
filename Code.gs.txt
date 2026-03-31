@@ -27,10 +27,11 @@ const DISTRIBUTION_RPS_EXPONENT = 2.7;
 const DISTRIBUTION_SOFTMAX_TAU = 0.30;
 const LINK_ROUTER_AUTO_SYNC_CROSS_DAY_WINDOW_HOURS = 4;
 const LINK_ROUTER_BATCH_CONTROL_SHEET = 'Controle - Sync Lotes';
-const LINK_ROUTER_SYNC_BATCH_SIZE = 35;
+const LINK_ROUTER_BATCH_EVENT_SHEET = 'Controle - Sync Eventos';
+const LINK_ROUTER_SYNC_BATCH_SIZE = 12;
 const LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES = 1;
-const LINK_ROUTER_SYNC_BATCH_MAX_SECONDS = 1700;
-const LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS = 6;
+const LINK_ROUTER_SYNC_BATCH_MAX_SECONDS = 240;
+const LINK_ROUTER_SYNC_MAX_PENDING_BATCH_TRIGGERS = 10;
 const LINK_ROUTER_SYNC_ROUTE_TIMEOUT_RETRY_LIMIT = 2;
 const LINK_ROUTER_BATCH_STATE_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_STATE_';
 const LINK_ROUTER_BATCH_TRIGGER_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_TRIGGER_';
@@ -3796,7 +3797,11 @@ function syncLinkRouterDistribution(request, options) {
     row[10] = message;
     return row;
   });
-  appendLinkRouterHistory_(historyRows, options.historySheetName);
+  if (options.historyBuffer && Array.isArray(options.historyBuffer)) {
+    options.historyBuffer.push.apply(options.historyBuffer, historyRows);
+  } else {
+    appendLinkRouterHistory_(historyRows, options.historySheetName);
+  }
 
   if (!success) {
     throw new Error(message);
@@ -3818,6 +3823,38 @@ function syncLinkRouterDistribution(request, options) {
 function parseLinkRouterId_(value) {
   var num = Number(value);
   return isNaN(num) ? value : num;
+}
+
+function ensureLinkRouterBatchEventSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName(LINK_ROUTER_BATCH_EVENT_SHEET);
+  var headers = ['Timestamp', 'Batch ID', 'Lote', 'Operação', 'Tráfego', 'Rota', 'Status', 'Duração (ms)', 'Mensagem'];
+  if (!sheet) {
+    sheet = ss.insertSheet(LINK_ROUTER_BATCH_EVENT_SHEET);
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+    return sheet;
+  }
+  var firstRow = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+  var headersMissing = false;
+  for (var i = 0; i < headers.length; i++) {
+    if (!firstRow[i] || firstRow[i] !== headers[i]) {
+      headersMissing = true;
+      break;
+    }
+  }
+  if (headersMissing) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function appendLinkRouterBatchEvents_(rows) {
+  if (!rows || !rows.length) return;
+  var sheet = ensureLinkRouterBatchEventSheet_();
+  var startRow = Math.max(sheet.getLastRow(), 1) + 1;
+  sheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
 }
 
 function ensureLinkRouterBatchControlSheet_() {
@@ -4160,6 +4197,7 @@ function runLinkRouterAutoSyncBatch(e) {
     props.deleteProperty(triggerKey);
     return;
   }
+
   var stateKey = buildLinkRouterBatchStateKey_(triggerInfo.batchId, triggerInfo.batchIndex);
   var stateJson = props.getProperty(stateKey);
   if (!stateJson) {
@@ -4175,144 +4213,181 @@ function runLinkRouterAutoSyncBatch(e) {
     return;
   }
 
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    state.scheduled = false;
+    state.nextEligibleAt = new Date(Date.now() + 60000).toISOString();
+    props.setProperty(stateKey, JSON.stringify(state));
+    if (triggerKey) props.deleteProperty(triggerKey);
+    return;
+  }
+
   var startTime = new Date();
   var startMs = startTime.getTime();
-  var snapshot = getConfigSnapshot_();
-  var trafficByType = snapshot.trafficByType || {};
-  var autoRange = state.autoRange || getLinkRouterAutoSyncDateRange_();
-  var batchHistorySheetName = state.historySheetName || getLinkRouterBatchHistorySheetName_(state.batchIndex);
-  ensureLinkRouterHistorySheet_(batchHistorySheetName);
   var successes = [];
   var failures = [];
   var processed = 0;
   var timedOut = false;
   var remainingIntegrations = [];
+  var historyBuffer = [];
+  var eventRows = [];
 
-  var integrations = state.integrations || [];
-  for (var integrationIndex = 0; integrationIndex < integrations.length; integrationIndex++) {
-    var integration = integrations[integrationIndex];
-    var elapsed = (Date.now() - startMs) / 1000;
-    if (elapsed >= LINK_ROUTER_SYNC_BATCH_MAX_SECONDS) {
-      timedOut = true;
-      remainingIntegrations = integrations.slice(integrationIndex);
-      break;
-    }
-    var trafficType = integration.trafficType;
-    var invalidRouteInfo = getInvalidRouteInfo_(integration);
-    if (invalidRouteInfo) {
-      failures.push({
-        operation: integration.operation,
-        traffic: trafficType,
-        message: 'Rota ignorada temporariamente (inválida): ' + (invalidRouteInfo.message || 'sem detalhe')
-      });
+  try {
+    var snapshot = getConfigSnapshot_();
+    var trafficByType = snapshot.trafficByType || {};
+    var autoRange = state.autoRange || getLinkRouterAutoSyncDateRange_();
+    var batchHistorySheetName = state.historySheetName || getLinkRouterBatchHistorySheetName_(state.batchIndex);
+    ensureLinkRouterHistorySheet_(batchHistorySheetName);
+
+    var integrations = state.integrations || [];
+    for (var integrationIndex = 0; integrationIndex < integrations.length; integrationIndex++) {
+      var integration = integrations[integrationIndex];
+      var elapsed = (Date.now() - startMs) / 1000;
+      if (elapsed >= LINK_ROUTER_SYNC_BATCH_MAX_SECONDS) {
+        timedOut = true;
+        remainingIntegrations = integrations.slice(integrationIndex);
+        break;
+      }
+
+      var routeStartMs = Date.now();
+      var trafficType = integration.trafficType;
+      var invalidRouteInfo = getInvalidRouteInfo_(integration);
+      if (invalidRouteInfo) {
+        var invalidMessage = 'Rota ignorada temporariamente (inválida): ' + (invalidRouteInfo.message || 'sem detalhe');
+        failures.push({ operation: integration.operation, traffic: trafficType, message: invalidMessage });
+        eventRows.push([new Date(), state.batchId, 'Lote ' + (state.batchIndex + 1), integration.operation || '', trafficType || '', integration.routeSlug || '', 'IGNORADA', Date.now() - routeStartMs, invalidMessage]);
+        processed++;
+        continue;
+      }
+
+      var sources = trafficByType[trafficType] || [];
+      if (!sources.length) {
+        var missingError = new Error('Nenhuma utm_source configurada para o tráfego vinculado.');
+        failures.push({ operation: integration.operation, traffic: trafficType, message: missingError.message });
+        logLinkRouterAutoSyncFailure_(integration, trafficType, missingError, batchHistorySheetName, historyBuffer);
+        eventRows.push([new Date(), state.batchId, 'Lote ' + (state.batchIndex + 1), integration.operation || '', trafficType || '', integration.routeSlug || '', 'ERRO', Date.now() - routeStartMs, missingError.message]);
+        processed++;
+        continue;
+      }
+
+      try {
+        var request = {
+          operation: integration.operation,
+          traffic: trafficType,
+          routeSlug: integration.routeSlug,
+          domainId: integration.domainId,
+          window: 'day',
+          mode: 'auto'
+        };
+        if (autoRange) {
+          request.startDate = autoRange.startDate;
+          request.endDate = autoRange.endDate;
+        }
+        var result = syncLinkRouterDistribution(request, { snapshot: snapshot, historySheetName: batchHistorySheetName, historyBuffer: historyBuffer });
+        successes.push({
+          operation: integration.operation,
+          traffic: trafficType,
+          linksUpdated: result && result.linksUpdated ? result.linksUpdated : 0,
+          unmatchedLinks: result && result.unmatchedLinks ? result.unmatchedLinks.length : 0,
+          leftoverShares: result && result.leftoverShares ? result.leftoverShares.length : 0
+        });
+        eventRows.push([new Date(), state.batchId, 'Lote ' + (state.batchIndex + 1), integration.operation || '', trafficType || '', integration.routeSlug || '', 'OK', Date.now() - routeStartMs, 'Sincronizado']);
+      } catch (err) {
+        var errorMessage = err && err.message ? err.message : String(err);
+        if (isRouteNotFoundError_(errorMessage)) {
+          markInvalidRoute_(integration, errorMessage);
+        }
+        failures.push({ operation: integration.operation, traffic: trafficType, message: errorMessage });
+        logLinkRouterAutoSyncFailure_(integration, trafficType, err, batchHistorySheetName, historyBuffer);
+        eventRows.push([new Date(), state.batchId, 'Lote ' + (state.batchIndex + 1), integration.operation || '', trafficType || '', integration.routeSlug || '', 'ERRO', Date.now() - routeStartMs, errorMessage]);
+      }
       processed++;
-      continue;
     }
-    var sources = trafficByType[trafficType] || [];
-    if (!sources.length) {
-      var missingError = new Error('Nenhuma utm_source configurada para o tráfego vinculado.');
-      failures.push({
-        operation: integration.operation,
-        traffic: trafficType,
-        message: missingError.message
-      });
-      logLinkRouterAutoSyncFailure_(integration, trafficType, missingError, batchHistorySheetName);
-      processed++;
-      continue;
-    }
-    try {
-      var request = {
-        operation: integration.operation,
-        traffic: trafficType,
-        routeSlug: integration.routeSlug,
-        domainId: integration.domainId,
-        window: 'day',
-        mode: 'auto'
-      };
-      if (autoRange) {
-        request.startDate = autoRange.startDate;
-        request.endDate = autoRange.endDate;
-      }
-      var result = syncLinkRouterDistribution(request, { snapshot: snapshot, historySheetName: batchHistorySheetName });
-      successes.push({
-        operation: integration.operation,
-        traffic: trafficType,
-        linksUpdated: result && result.linksUpdated ? result.linksUpdated : 0,
-        unmatchedLinks: result && result.unmatchedLinks ? result.unmatchedLinks.length : 0,
-        leftoverShares: result && result.leftoverShares ? result.leftoverShares.length : 0
-      });
-    } catch (err) {
-      var errorMessage = err && err.message ? err.message : String(err);
-      if (isRouteNotFoundError_(errorMessage)) {
-        markInvalidRoute_(integration, errorMessage);
-      }
-      failures.push({
-        operation: integration.operation,
-        traffic: trafficType,
-        message: errorMessage
-      });
-      logLinkRouterAutoSyncFailure_(integration, trafficType, err, batchHistorySheetName);
-    }
-    processed++;
-  }
 
-  var durationSeconds = Math.round((Date.now() - startMs) / 1000);
-  var status = timedOut ? 'PARCIAL' : 'CONCLUÍDO';
-  var message = timedOut ? ('Execução interrompida por tempo limite. Restantes: ' + remainingIntegrations.length + '.') : '';
-  if (timedOut && remainingIntegrations.length) {
-    var blockedIntegration = remainingIntegrations.shift();
-    var timeoutRetries = state.timeoutRetries || {};
-    var timeoutKey = buildLinkRouterIntegrationTimeoutKey_(blockedIntegration);
-    var timeoutCount = (timeoutRetries[timeoutKey] || 0) + 1;
-    timeoutRetries[timeoutKey] = timeoutCount;
-    state.timeoutRetries = timeoutRetries;
+    var durationSeconds = Math.round((Date.now() - startMs) / 1000);
+    var status = timedOut ? 'PARCIAL' : 'CONCLUÍDO';
+    var message = timedOut ? ('Execução interrompida por tempo limite. Restantes: ' + remainingIntegrations.length + '.') : '';
+    if (timedOut && remainingIntegrations.length) {
+      var blockedIntegration = remainingIntegrations.shift();
+      var timeoutRetries = state.timeoutRetries || {};
+      var timeoutKey = buildLinkRouterIntegrationTimeoutKey_(blockedIntegration);
+      var timeoutCount = (timeoutRetries[timeoutKey] || 0) + 1;
+      timeoutRetries[timeoutKey] = timeoutCount;
+      state.timeoutRetries = timeoutRetries;
 
-    if (timeoutCount <= LINK_ROUTER_SYNC_ROUTE_TIMEOUT_RETRY_LIMIT) {
-      remainingIntegrations.push(blockedIntegration);
-      message += ' Rota travada reagendada para o final da fila (tentativa ' + timeoutCount + '/' + LINK_ROUTER_SYNC_ROUTE_TIMEOUT_RETRY_LIMIT + ').';
-    } else {
-      failures.push({
-        operation: blockedIntegration.operation,
-        traffic: blockedIntegration.trafficType,
-        message: 'Rota pulada após exceder limite de timeout (' + timeoutCount + ' tentativas).'
-      });
-      logLinkRouterAutoSyncFailure_(blockedIntegration, blockedIntegration.trafficType, new Error('Rota pulada após exceder limite de timeout.'), batchHistorySheetName);
-      message += ' Rota pulada após exceder limite de timeout.';
-    }
-  }
-  updateLinkRouterBatchControlRow_(state.row, {
-    timestamp: startTime,
-    batchId: state.batchId,
-    batchLabel: 'Lote ' + (state.batchIndex + 1) + '/' + (state.totalBatches || ''),
-    status: status,
-    processed: processed,
-    successes: successes.length,
-    failures: failures.length,
-    durationSeconds: durationSeconds,
-    message: message
-  });
-
-  if (timedOut && remainingIntegrations.length) {
-    state.integrations = remainingIntegrations;
-    state.scheduled = false;
-    state.nextEligibleAt = new Date(Date.now() + (LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000)).toISOString();
-    props.setProperty(stateKey, JSON.stringify(state));
-  } else {
-    props.deleteProperty(stateKey);
-  }
-  if (triggerKey) {
-    props.deleteProperty(triggerKey);
-  }
-  if (triggerUid) {
-    ScriptApp.getProjectTriggers().forEach(function (trigger) {
-      var uid = trigger.getUniqueId ? trigger.getUniqueId() : '';
-      if (uid && uid === triggerUid) {
-        ScriptApp.deleteTrigger(trigger);
+      if (timeoutCount <= LINK_ROUTER_SYNC_ROUTE_TIMEOUT_RETRY_LIMIT) {
+        remainingIntegrations.push(blockedIntegration);
+        message += ' Rota travada reagendada para o final da fila (tentativa ' + timeoutCount + '/' + LINK_ROUTER_SYNC_ROUTE_TIMEOUT_RETRY_LIMIT + ').';
+      } else {
+        failures.push({
+          operation: blockedIntegration.operation,
+          traffic: blockedIntegration.trafficType,
+          message: 'Rota pulada após exceder limite de timeout (' + timeoutCount + ' tentativas).'
+        });
+        logLinkRouterAutoSyncFailure_(blockedIntegration, blockedIntegration.trafficType, new Error('Rota pulada após exceder limite de timeout.'), batchHistorySheetName, historyBuffer);
+        eventRows.push([new Date(), state.batchId, 'Lote ' + (state.batchIndex + 1), blockedIntegration.operation || '', blockedIntegration.trafficType || '', blockedIntegration.routeSlug || '', 'PULADA', 0, 'Excedeu limite de timeout']);
+        message += ' Rota pulada após exceder limite de timeout.';
       }
+    }
+
+    updateLinkRouterBatchControlRow_(state.row, {
+      timestamp: startTime,
+      batchId: state.batchId,
+      batchLabel: 'Lote ' + (state.batchIndex + 1) + '/' + (state.totalBatches || ''),
+      status: status,
+      processed: processed,
+      successes: successes.length,
+      failures: failures.length,
+      durationSeconds: durationSeconds,
+      message: message
     });
-  }
 
-  schedulePendingLinkRouterBatches_(state.batchId, state.totalBatches || 0, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000, 1);
+    if (historyBuffer.length) {
+      appendLinkRouterHistory_(historyBuffer, batchHistorySheetName);
+    }
+    if (eventRows.length) {
+      appendLinkRouterBatchEvents_(eventRows);
+    }
+
+    if (timedOut && remainingIntegrations.length) {
+      state.integrations = remainingIntegrations;
+      state.scheduled = false;
+      state.nextEligibleAt = new Date(Date.now() + (LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000)).toISOString();
+      props.setProperty(stateKey, JSON.stringify(state));
+    } else {
+      props.deleteProperty(stateKey);
+    }
+  } catch (err) {
+    var fatalMessage = err && err.message ? err.message : String(err);
+    updateLinkRouterBatchControlRow_(state.row, {
+      timestamp: startTime,
+      batchId: state.batchId,
+      batchLabel: 'Lote ' + (state.batchIndex + 1) + '/' + (state.totalBatches || ''),
+      status: 'ERRO',
+      processed: processed,
+      successes: successes.length,
+      failures: failures.length + 1,
+      durationSeconds: Math.round((Date.now() - startMs) / 1000),
+      message: 'Falha inesperada: ' + fatalMessage
+    });
+    state.scheduled = false;
+    state.nextEligibleAt = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+    props.setProperty(stateKey, JSON.stringify(state));
+  } finally {
+    if (triggerKey) {
+      props.deleteProperty(triggerKey);
+    }
+    if (triggerUid) {
+      ScriptApp.getProjectTriggers().forEach(function (trigger) {
+        var uid = trigger.getUniqueId ? trigger.getUniqueId() : '';
+        if (uid && uid === triggerUid) {
+          ScriptApp.deleteTrigger(trigger);
+        }
+      });
+    }
+    schedulePendingLinkRouterBatches_(state.batchId, state.totalBatches || 0, LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000, 1);
+    lock.releaseLock();
+  }
 
   var remainingState = false;
   for (var remainingIndex = 0; remainingIndex < (state.totalBatches || 0); remainingIndex++) {
@@ -4391,7 +4466,7 @@ function updateLinkRouterAutoSyncTrigger_(snapshot) {
   }
 }
 
-function logLinkRouterAutoSyncFailure_(integration, trafficType, error, historySheetName) {
+function logLinkRouterAutoSyncFailure_(integration, trafficType, error, historySheetName, historyBuffer) {
   var message = error && error.message ? error.message : String(error || 'Erro desconhecido');
   var row = [
     new Date(),
@@ -4406,6 +4481,10 @@ function logLinkRouterAutoSyncFailure_(integration, trafficType, error, historyS
     'ERRO',
     message
   ];
+  if (historyBuffer && Array.isArray(historyBuffer)) {
+    historyBuffer.push(row);
+    return;
+  }
   appendLinkRouterHistory_([row], historySheetName);
 }
 
