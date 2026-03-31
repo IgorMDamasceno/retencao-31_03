@@ -4149,7 +4149,6 @@ function runLinkRouterAutoSyncOrchestrator() {
   batches.forEach(function (batch, index) {
     var batchLabel = 'Lote ' + (index + 1) + '/' + batches.length;
     var batchHistorySheetName = getLinkRouterBatchHistorySheetName_(index);
-    ensureLinkRouterHistorySheet_(batchHistorySheetName);
     var rowNumber = appendLinkRouterBatchControlRow_(controlSheet, {
       timestamp: new Date(),
       batchId: batchId,
@@ -4237,6 +4236,7 @@ function runLinkRouterAutoSyncBatch(e) {
     var trafficByType = snapshot.trafficByType || {};
     var autoRange = state.autoRange || getLinkRouterAutoSyncDateRange_();
     var batchHistorySheetName = state.historySheetName || getLinkRouterBatchHistorySheetName_(state.batchIndex);
+    // Criação lazy da aba de histórico para evitar timeout no orquestrador ao inicializar muitos lotes.
     ensureLinkRouterHistorySheet_(batchHistorySheetName);
 
     var integrations = state.integrations || [];
